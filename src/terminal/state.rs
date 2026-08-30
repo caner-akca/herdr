@@ -1346,7 +1346,7 @@ impl TerminalState {
     fn session_start_source_is_recognized(session_start_source: Option<&str>) -> bool {
         matches!(
             session_start_source,
-            Some("startup" | "clear" | "resume" | "compact" | "new" | "fork" | "select")
+            Some("startup" | "clear" | "resume" | "compact" | "new" | "fork" | "select" | "reload")
         )
     }
 
@@ -1489,6 +1489,19 @@ impl TerminalState {
                 suppressed.replacement_session_ref = Some(session_ref);
             }
             self.hook_report_sequences.insert(source.clone(), seq);
+            // A `reload` session start is a live process re-anchoring its
+            // existing session, so a recorded process exit for the same
+            // detected agent was a false observation. Drop it so the live
+            // agent's effective label (and its `agent list` registration) is
+            // restored (refs #3225). Other session-start reasons (such as
+            // `startup`) can follow a genuine exit and keep the existing
+            // replay-on-process-evidence flow.
+            if session_start_source.as_deref() == Some("reload")
+                && known_agent.is_some()
+                && self.detected_agent == known_agent
+            {
+                self.recent_agent_process_exit = None;
+            }
 
             if process_present {
                 self.clear_full_lifecycle_hook_suppression_for_detected_agent(None, known_agent);
@@ -2863,6 +2876,79 @@ mod tests {
         assert!(late.is_none());
         assert!(terminal.hook_authority.is_none());
         assert_eq!(terminal.state, AgentState::Idle);
+    }
+
+    #[test]
+    fn issue_3225_false_exit_loses_live_pi_registration() {
+        let now = Instant::now();
+        let mut terminal = test_terminal();
+        let session_ref =
+            crate::agent_resume::AgentSessionRef::path(test_session_path("issue-3225-pi.jsonl"))
+                .expect("test session path should be valid");
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:pi".into(),
+                "pi".into(),
+                Some(session_ref.clone()),
+                Some(20),
+                Some("new".into()),
+            )
+            .expect("initial Pi session should be accepted");
+        terminal
+            .set_hook_authority_at(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                Some(session_ref.clone()),
+                Some(21),
+                now,
+            )
+            .expect("initial Pi state should be accepted");
+        terminal.set_agent_name("reviewer".into());
+
+        let exit = terminal.set_detected_state_with_screen_signals_at(
+            Some(Agent::Pi),
+            AgentState::Idle,
+            false,
+            false,
+            false,
+            true,
+            now + Duration::from_secs(1),
+        );
+
+        assert!(exit.agent_released);
+        assert!(exit.session_ref_changed);
+        assert!(terminal.hook_authority.is_none());
+        assert!(terminal.persisted_agent_session.is_none());
+        assert!(terminal.agent_name.is_none());
+
+        let reload = terminal.set_agent_session_ref_for_session_start(
+            "herdr:pi".into(),
+            "pi".into(),
+            Some(session_ref.clone()),
+            Some(22),
+            Some("reload".into()),
+        );
+        let working = terminal.set_hook_authority_at(
+            "herdr:pi".into(),
+            "pi".into(),
+            AgentState::Working,
+            None,
+            Some(session_ref),
+            Some(23),
+            now + Duration::from_secs(2),
+        );
+
+        assert!(reload.is_none());
+        assert!(working.is_none());
+        assert!(terminal.hook_authority.is_none());
+        assert!(terminal.persisted_agent_session.is_none());
+        assert!(
+            terminal.is_agent_terminal(),
+            "a live Pi should re-register after a false process-exit observation"
+        );
     }
 
     #[test]
