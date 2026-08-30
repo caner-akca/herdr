@@ -73,7 +73,7 @@ pub fn normalize_session_start_source(value: Option<String>) -> Option<String> {
     match value.as_deref().map(str::trim) {
         Some(
             source @ ("startup" | "resume" | "clear" | "compact" | "branch" | "new" | "fork"
-            | "select"),
+            | "select" | "reload"),
         ) => Some(source.to_string()),
         _ => None,
     }
@@ -636,6 +636,10 @@ mod tests {
         assert_eq!(
             normalize_session_start_source(Some("select".into())),
             Some("select".into())
+        );
+        assert_eq!(
+            normalize_session_start_source(Some("reload".into())),
+            Some("reload".into())
         );
         assert_eq!(
             normalize_session_start_source(Some(" resume ".into())),

@@ -2929,7 +2929,9 @@ mod tests {
             "pi".into(),
             Some(session_ref.clone()),
             Some(22),
-            Some("reload".into()),
+            // Route the reason through the public normalizer so this test fails
+            // if `reload` stops surviving the API path, not just the arbitration.
+            crate::agent_resume::normalize_session_start_source(Some("reload".into())),
         );
         let working = terminal.set_hook_authority_at(
             "herdr:pi".into(),
