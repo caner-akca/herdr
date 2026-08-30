@@ -2683,13 +2683,20 @@ fn ghostty_recent_text_for_terminal(
     terminal: &crate::ghostty::Terminal,
     lines: usize,
 ) -> Result<String, crate::ghostty::Error> {
-    let Some((start, end, cols)) = ghostty_recent_read_range(terminal, lines)? else {
+    let Some((start, end, _cols)) = ghostty_recent_read_range(terminal, lines)? else {
         return Ok(String::new());
     };
-    let mut rows = Vec::with_capacity(end.saturating_sub(start).saturating_add(1));
-    for y in start..=end {
-        rows.push(ghostty_screen_row(terminal, cols, y as u32)?);
-    }
+    // Read whole rows: `screen_text_rows_range` resolves one grid reference
+    // per row and walks its cells in place. Per-cell `screen_cell()` calls
+    // resolved every coordinate from scratch, and each resolution can
+    // traverse the entire scrollback through `PageList.pin`, which burned a
+    // core inside the locked detection snapshot on panes with retained
+    // scrollback (refs #2592).
+    let mut rows: Vec<String> = terminal
+        .screen_text_rows_range(start, end.saturating_add(1))?
+        .iter()
+        .map(screen_text_row_to_string)
+        .collect();
     trim_trailing_blank_rows(&mut rows);
     Ok(recent_text_from_rows(&rows, lines))
 }
@@ -2764,30 +2771,25 @@ fn ghostty_extract_selection(
         .read_text_screen((start_col, start_row), (end_col, end_row), false)
 }
 
-fn ghostty_screen_row(
-    terminal: &crate::ghostty::Terminal,
-    cols: u16,
-    y: u32,
-) -> Result<String, crate::ghostty::Error> {
+fn screen_text_row_to_string(row: &crate::ghostty::ScreenTextRow) -> String {
     let mut line = String::new();
-    for x in 0..cols {
-        let (wide, graphemes) = terminal.screen_cell(x, y)?;
-        if wide == crate::ghostty::CellWide::SpacerTail {
+    for cell in &row.cells {
+        if cell.wide == crate::ghostty::CellWide::SpacerTail {
             continue;
         }
-        if graphemes.is_empty()
-            || graphemes.first().copied() == Some(crate::ghostty::KITTY_UNICODE_PLACEHOLDER)
+        if cell.graphemes.is_empty()
+            || cell.graphemes.first().copied() == Some(crate::ghostty::KITTY_UNICODE_PLACEHOLDER)
         {
             line.push(' ');
         } else {
-            for codepoint in graphemes {
+            for &codepoint in &cell.graphemes {
                 if let Some(ch) = char::from_u32(codepoint) {
                     line.push(ch);
                 }
             }
         }
     }
-    Ok(line.trim_end().to_string())
+    line.trim_end().to_string()
 }
 
 fn ghostty_line_from_cells(
@@ -5168,6 +5170,28 @@ mod tests {
 
         assert!(pane.visible_text().contains("000000"));
         assert_eq!(pane.detection_text(), bottom_snapshot);
+    }
+
+    #[test]
+    fn detection_snapshot_scrollback_scaling() {
+        let (tx, _rx) = mpsc::channel(4);
+        let mut terminal = crate::ghostty::Terminal::new(120, 40, 10_000_000).unwrap();
+        write_numbered_lines(&mut terminal, 20_000);
+        let scrollback_rows = terminal.scrollback_rows().unwrap();
+        assert!(scrollback_rows > 0, "test setup did not retain scrollback");
+        let pane = GhosttyPaneTerminal::new(terminal, tx).unwrap();
+
+        crate::ghostty::take_screen_coordinate_resolutions();
+        let started = Instant::now();
+        let snapshot = pane.detection_text();
+        let elapsed = started.elapsed();
+        let coordinate_resolutions = crate::ghostty::take_screen_coordinate_resolutions();
+
+        assert!(snapshot.contains("019999"));
+        assert!(
+            coordinate_resolutions <= 40,
+            "detection snapshot over {scrollback_rows} scrollback rows took {elapsed:?} and resolved {coordinate_resolutions} independent screen coordinates; expected at most one scrollback traversal per output row"
+        );
     }
 
     #[test]

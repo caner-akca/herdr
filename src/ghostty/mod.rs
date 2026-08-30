@@ -438,6 +438,21 @@ pub enum CellWide {
     SpacerHead,
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// Counts `ghostty_terminal_grid_ref` resolutions; each one can traverse
+    /// scrollback through `PageList.pin` (refs #2592).
+    static SCREEN_COORDINATE_RESOLUTIONS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Returns and resets the number of screen-coordinate resolutions performed
+/// on this thread.
+#[cfg(test)]
+pub(crate) fn take_screen_coordinate_resolutions() -> usize {
+    SCREEN_COORDINATE_RESOLUTIONS.with(|count| count.replace(0))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ScreenTextCell {
     pub wide: CellWide,
@@ -1163,6 +1178,8 @@ impl Terminal {
     }
 
     fn grid_ref(&self, point: ffi::GhosttyPoint) -> Result<ffi::GhosttyGridRef, Error> {
+        #[cfg(test)]
+        SCREEN_COORDINATE_RESOLUTIONS.with(|count| count.set(count.get().saturating_add(1)));
         let mut grid_ref = ffi::GhosttyGridRef {
             size: mem::size_of::<ffi::GhosttyGridRef>(),
             ..Default::default()
