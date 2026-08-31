@@ -103,7 +103,10 @@ takes over the terminal
 
 This affects `herdr agent start ... -- <long args>`, `herdr pane run`, and
 pasted text — anything that composes a single line over 1024 bytes. The cap is
-per line, not per write, so multi-line input of any total size is unaffected.
+per line, not per write: multi-line input is delivered whatever its total size,
+as long as every line in it fits. Text already typed into the pane and not yet
+read counts toward the line being composed, so a short injection appended to a
+long unread line can still be cut.
 
 Interactive agents such as Claude Code put the terminal in raw mode and are not
 subject to the cap, so the usual remedy is to retry once the agent has taken

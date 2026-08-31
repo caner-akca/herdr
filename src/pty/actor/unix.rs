@@ -26,8 +26,9 @@ const HANDOFF_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 /// The runner is a dedicated thread that answers on its next loop pass, so this
 /// normally costs microseconds and only a submission too large to be a
 /// keystroke ever waits at all. The bound exists so a runner buried in output
-/// cannot stall the caller, which may be a runtime worker.
-const CANONICAL_VERDICT_TIMEOUT: Duration = Duration::from_millis(100);
+/// cannot stall the caller, which may be a runtime worker; expiring it refuses
+/// the write, so it is set well past a healthy answer to keep that refusal rare.
+const CANONICAL_VERDICT_TIMEOUT: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActorState {
@@ -126,9 +127,11 @@ impl PtyIoActorHandle {
     /// truncated at all, which excludes every keystroke, mouse report and
     /// terminal response, so the common write never pays for this.
     ///
-    /// The discipline can change between the verdict and the write. That race
-    /// costs a refusal the kernel would have accepted, which the caller can
-    /// retry; it never costs delivered bytes.
+    /// Every uncertain answer refuses. The discipline can change between the
+    /// verdict and the write, and a runner may not answer in time; both cost a
+    /// refusal the kernel would have accepted, which the caller can retry.
+    /// Neither costs delivered bytes, and neither reports a write that did not
+    /// land as successful.
     fn reject_if_discipline_would_truncate(&self, bytes: &Bytes) -> Result<(), PtyWriteError> {
         if !crate::platform::may_exceed_canonical_queue(bytes) {
             return Ok(());
@@ -145,14 +148,17 @@ impl PtyIoActorHandle {
             return Err(PtyWriteError::Unavailable);
         }
         self.wake_actor();
-        // A runner too busy to answer leaves the write to the behaviour it had
-        // before this check existed rather than refusing on a guess. The gate
-        // above is already closed during a handoff drain, which is the only
-        // place the runner stays away from its control channel for long.
+        // Writing without a verdict would restore the silent truncation this
+        // check exists to remove: the runner would drop the late reply and
+        // then write the bytes unchecked while the caller was told they
+        // landed. An unanswered question is refused instead, which the caller
+        // can retry. The gate above is already closed during a handoff drain,
+        // the only place the runner stays away from its control channel long
+        // enough for this to be reachable.
         match verdict.recv_timeout(CANONICAL_VERDICT_TIMEOUT) {
             Ok(Some(limit)) => Err(PtyWriteError::LineExceedsCanonicalQueue { limit }),
             Ok(None) => Ok(()),
-            Err(_) => Ok(()),
+            Err(_) => Err(PtyWriteError::DisciplineUnknown),
         }
     }
 
@@ -1705,5 +1711,40 @@ mod tests {
         );
         handle.shutdown();
         assert_eq!(received, submitted, "every line must be delivered");
+    }
+
+    /// refs #2862: an unanswered discipline question must refuse rather than
+    /// write. A runner that never services its control channel used to let the
+    /// submission through unchecked, which is the silent truncation this whole
+    /// check exists to remove.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_submission_is_refused_when_the_runner_cannot_report_its_discipline() {
+        let (data_tx, mut data_rx) = mpsc::channel(ACTOR_COMMAND_BUFFER);
+        // Held, never drained: the runner is busy elsewhere.
+        let (control_tx, _control_rx) = std_mpsc::channel();
+        let (wake, _wake_read_fd) = test_wake_pair();
+        let handle = PtyIoActorHandle {
+            data_tx,
+            control_tx,
+            wake,
+            user_writes: Arc::new(Mutex::new(UserWriteGate { accepting: true })),
+            controls: Arc::new(Mutex::new(SharedPtyControls::default())),
+            response_order: Arc::new(Mutex::new(())),
+        };
+
+        let err = handle
+            .try_write_user_input(Bytes::from(vec![b'A'; 1400]))
+            .expect_err("a submission with no verdict must be refused");
+        assert_eq!(err, PtyWriteError::DisciplineUnknown);
+        assert!(
+            data_rx.try_recv().is_err(),
+            "a refused submission must never reach the write queue"
+        );
+
+        // A submission the queue cannot truncate is unaffected: it never asks.
+        handle
+            .try_write_user_input(Bytes::from(vec![b'A'; 1024]))
+            .expect("input within the cap must not wait on a verdict");
     }
 }

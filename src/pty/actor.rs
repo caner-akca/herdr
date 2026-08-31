@@ -13,6 +13,11 @@ pub(crate) enum PtyWriteError {
     /// no such discipline, so Windows never reports this.
     #[cfg(unix)]
     LineExceedsCanonicalQueue { limit: usize },
+    /// The pane could not say whether its line discipline would truncate the
+    /// write. Reporting the refusal is the only truthful answer left: writing
+    /// anyway is what silently truncated input before this check existed.
+    #[cfg(unix)]
+    DisciplineUnknown,
 }
 
 impl std::fmt::Display for PtyWriteError {
@@ -25,6 +30,12 @@ impl std::fmt::Display for PtyWriteError {
                 "pane's foreground program is reading in canonical mode, which truncates \
                  input lines longer than {limit} bytes; send shorter lines or retry once \
                  the program takes over the terminal"
+            ),
+            #[cfg(unix)]
+            Self::DisciplineUnknown => write!(
+                f,
+                "pane did not report whether its terminal would truncate this input in time; \
+                 retry"
             ),
         }
     }
