@@ -1,7 +1,7 @@
 use std::fs;
 use std::io::{self, Read};
 #[cfg(unix)]
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 #[cfg(unix)]
@@ -51,16 +51,11 @@ pub(crate) fn connect_local_stream(path: &Path) -> io::Result<LocalStream> {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn bind_local_listener(path: &Path) -> io::Result<LocalListener> {
     #[cfg(unix)]
     {
-        use interprocess::local_socket::{prelude::*, GenericFilePath, ListenerOptions};
-
-        let name = path.to_fs_name::<GenericFilePath>()?;
-        ListenerOptions::new()
-            .name(name)
-            .reclaim_name(false)
-            .create_sync()
+        crate::platform::bind_local_listener_for_test(path)
     }
 
     #[cfg(windows)]
@@ -138,12 +133,12 @@ pub(crate) fn shutdown_local_stream_write(stream: &LocalStream) -> io::Result<()
     }
 }
 
-/// Binds a listener for private terminal traffic. Unix callers restrict the
-/// socket file after binding; Windows must set the named-pipe DACL at creation.
+/// Binds a listener for private local traffic and applies the platform's
+/// access boundary before returning it to a caller.
 pub(crate) fn bind_private_local_listener(path: &Path) -> io::Result<LocalListener> {
     #[cfg(unix)]
     {
-        bind_local_listener(path)
+        crate::platform::bind_private_local_listener(path)
     }
 
     #[cfg(windows)]
@@ -165,6 +160,17 @@ pub(crate) fn bind_private_local_listener(path: &Path) -> io::Result<LocalListen
             .create_sync()?;
         fs::write(path, windows_socket_marker())?;
         Ok(listener)
+    }
+}
+
+/// Binds a private filesystem Unix listener and exposes the standard-library
+/// listener needed by descriptor-passing protocols.
+#[cfg(unix)]
+pub(crate) fn bind_private_unix_listener(
+    path: &Path,
+) -> io::Result<std::os::unix::net::UnixListener> {
+    match bind_private_local_listener(path)? {
+        LocalListener::UdSocket(listener) => Ok(listener.into()),
     }
 }
 
@@ -330,18 +336,6 @@ fn windows_socket_marker() -> String {
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
     format!("{}:{now}", std::process::id())
-}
-
-#[cfg(unix)]
-pub(crate) fn restrict_socket_permissions(path: &Path, mode: u32) -> io::Result<()> {
-    let mut permissions = fs::metadata(path)?.permissions();
-    permissions.set_mode(mode);
-    fs::set_permissions(path, permissions)
-}
-
-#[cfg(windows)]
-pub(crate) fn restrict_socket_permissions(_path: &Path, _mode: u32) -> io::Result<()> {
-    Ok(())
 }
 
 #[cfg(test)]

@@ -134,9 +134,8 @@ pub(crate) fn cleanup_failed_import_child(child: &mut Child) {
 #[cfg(unix)]
 pub(crate) fn bind_listener(socket_path: &Path) -> io::Result<UnixListener> {
     let _ = std::fs::remove_file(socket_path);
-    let listener = UnixListener::bind(socket_path)?;
+    let listener = crate::ipc::bind_private_unix_listener(socket_path)?;
     listener.set_nonblocking(true)?;
-    restrict_socket_permissions(socket_path)?;
     Ok(listener)
 }
 
@@ -321,13 +320,6 @@ pub(crate) fn manifest_for(
         panes,
         api_window_title,
     }
-}
-
-#[cfg(unix)]
-fn restrict_socket_permissions(path: &Path) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
 }
 
 #[cfg(unix)]
@@ -520,5 +512,25 @@ mod tests {
             serde_json::from_value(value).expect("an older manifest should still load");
 
         assert!(older.api_window_title.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handoff_listener_uses_private_socket_binding() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = std::env::temp_dir().join(format!("herdr-handoff-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        let socket = dir.join("handoff.sock");
+
+        let listener = bind_listener(&socket).unwrap();
+        assert_eq!(
+            std::fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

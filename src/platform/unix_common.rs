@@ -1,4 +1,84 @@
+use std::fs;
+use std::io;
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+
+use interprocess::local_socket::{prelude::*, GenericFilePath, Listener, ListenerOptions};
+use interprocess::os::unix::local_socket::ListenerOptionsExt as _;
+
+/// Socket file mode for Herdr's private listeners (owner read/write only).
+const SOCKET_PERMISSION_MODE: u32 = 0o600;
+
+/// Binds a listener for private local traffic with owner-only permissions.
+///
+/// The mode is applied to the socket descriptor before `bind()`, so the socket's
+/// pathname is never `chmod()`ed and filesystems that reject permission changes
+/// on socket inodes are never asked to. Platforms whose kernel cannot set a
+/// socket's mode before bind keep the previous bind-then-restrict behavior.
+pub(crate) fn bind_private_local_listener(path: &Path) -> io::Result<Listener> {
+    bind_private_socket_with(path, bind_local_listener, restrict_socket_permissions)
+}
+
+fn bind_local_listener(path: &Path, mode: Option<u32>) -> io::Result<Listener> {
+    let name = path.to_fs_name::<GenericFilePath>()?;
+    let options = ListenerOptions::new().name(name).reclaim_name(false);
+    match mode {
+        Some(mode) => options.mode(mode as libc::mode_t).create_sync(),
+        None => options.create_sync(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn bind_local_listener_for_test(path: &Path) -> io::Result<Listener> {
+    bind_local_listener(path, None)
+}
+
+fn bind_private_socket_with<T>(
+    path: &Path,
+    mut bind: impl FnMut(&Path, Option<u32>) -> io::Result<T>,
+    restrict: impl FnOnce(&Path) -> io::Result<()>,
+) -> io::Result<T> {
+    match bind(path, Some(SOCKET_PERMISSION_MODE)) {
+        Ok(bound) => Ok(bound),
+        // The platform cannot set a socket's mode before bind. Restrict the
+        // bound socket instead, exactly as Herdr did before creation-time modes.
+        Err(err) if err.kind() == io::ErrorKind::Unsupported => {
+            let bound = bind(path, None)?;
+            let bound_socket = socket_identity(path);
+            if let Err(err) = restrict(path) {
+                // The socket is published but unrestricted. Listeners are
+                // created with name reclamation disabled, so unbind it and take
+                // the pathname down instead of leaving it for the next start.
+                drop(bound);
+                remove_socket_if_unchanged(path, bound_socket);
+                return Err(err);
+            }
+            Ok(bound)
+        }
+        Err(err) => Err(err),
+    }
+}
+
+fn restrict_socket_permissions(path: &Path) -> io::Result<()> {
+    fs::set_permissions(path, fs::Permissions::from_mode(SOCKET_PERMISSION_MODE))
+}
+
+/// Identifies the socket at `path`, or `None` when it is absent or not a socket.
+fn socket_identity(path: &Path) -> Option<(u64, u64)> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    metadata
+        .file_type()
+        .is_socket()
+        .then(|| (metadata.dev(), metadata.ino()))
+}
+
+/// Unlinks `path` only while it still holds the socket Herdr bound there, so a
+/// pathname another process substituted is left alone.
+fn remove_socket_if_unchanged(path: &Path, bound: Option<(u64, u64)>) {
+    if bound.is_some() && socket_identity(path) == bound {
+        let _ = fs::remove_file(path);
+    }
+}
 
 fn set_sigpipe_disposition(handler: libc::sighandler_t) {
     let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -238,6 +318,19 @@ pub(crate) fn set_default_plugin_pane_pwd(env: &mut Vec<(String, String)>, cwd: 
 mod tests {
     use super::*;
 
+    fn temp_test_dir(label: &str) -> PathBuf {
+        let path = Path::new("/tmp").join(format!(
+            "herdr-platform-socket-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&path).unwrap();
+        path
+    }
+
     #[test]
     fn plugin_pane_pwd_defaults_to_cwd_without_overriding_explicit_env() {
         let cwd = Path::new("/plugin-cwd");
@@ -254,5 +347,139 @@ mod tests {
     fn remote_ssh_config_dir_rejects_overlong_control_socket_name() {
         let err = create_remote_ssh_config_dir(&"x".repeat(200)).unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn private_local_listener_restricts_socket_to_owner() {
+        let parent = temp_test_dir("owner-only");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).unwrap();
+        let socket = parent.join("herdr.sock");
+
+        let listener = bind_private_local_listener(&socket).unwrap();
+
+        assert_eq!(
+            fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+            0o755,
+            "binding a private socket must not alter its parent directory"
+        );
+
+        drop(listener);
+        fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[test]
+    fn private_socket_restricts_after_bind_when_creation_mode_is_unsupported() {
+        let parent = temp_test_dir("post-bind");
+        let socket = parent.join("herdr.sock");
+        let mut attempts = Vec::new();
+
+        let listener = bind_private_socket_with(
+            &socket,
+            |path, requested_mode| {
+                attempts.push(requested_mode);
+                if requested_mode.is_some() {
+                    return Err(io::Error::from(io::ErrorKind::Unsupported));
+                }
+                std::os::unix::net::UnixListener::bind(path)
+            },
+            restrict_socket_permissions,
+        )
+        .unwrap();
+
+        assert_eq!(attempts, [Some(0o600), None]);
+        assert_eq!(
+            fs::metadata(&socket).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        drop(listener);
+        fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[test]
+    fn private_socket_keeps_other_creation_errors_fatal() {
+        let parent = temp_test_dir("fatal");
+        let socket = parent.join("herdr.sock");
+        let mut attempts = Vec::new();
+
+        let err = bind_private_socket_with(
+            &socket,
+            |_path, requested_mode| {
+                attempts.push(requested_mode);
+                Err::<std::os::unix::net::UnixListener, _>(io::Error::from(
+                    io::ErrorKind::PermissionDenied,
+                ))
+            },
+            restrict_socket_permissions,
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(attempts, [Some(0o600)]);
+        assert!(!socket.exists());
+        fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[test]
+    fn private_socket_is_removed_when_post_bind_restriction_fails() {
+        let parent = temp_test_dir("restrict-failure");
+        let socket = parent.join("herdr.sock");
+
+        let err = bind_private_socket_with(
+            &socket,
+            |path, requested_mode| {
+                if requested_mode.is_some() {
+                    return Err(io::Error::from(io::ErrorKind::Unsupported));
+                }
+                std::os::unix::net::UnixListener::bind(path)
+            },
+            |_path| Err(io::Error::from(io::ErrorKind::PermissionDenied)),
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            !socket.exists(),
+            "an unrestricted socket must not stay published"
+        );
+        fs::remove_dir_all(&parent).unwrap();
+    }
+
+    #[test]
+    fn restriction_failure_leaves_a_replaced_pathname_alone() {
+        let parent = temp_test_dir("restrict-replacement");
+        let socket = parent.join("herdr.sock");
+        let replacement = parent.join("replacement.sock");
+
+        let err = bind_private_socket_with(
+            &socket,
+            |path, requested_mode| {
+                if requested_mode.is_some() {
+                    return Err(io::Error::from(io::ErrorKind::Unsupported));
+                }
+                std::os::unix::net::UnixListener::bind(path)
+            },
+            |path| {
+                // Stand in for another process swapping the pathname between
+                // bind and the failing restriction. Dropping the listener does
+                // not unlink its pathname.
+                std::os::unix::net::UnixListener::bind(&replacement)?;
+                fs::remove_file(path)?;
+                fs::rename(&replacement, path)?;
+                Err(io::Error::from(io::ErrorKind::PermissionDenied))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert!(
+            socket.exists(),
+            "a pathname Herdr no longer owns must not be unlinked"
+        );
+        fs::remove_dir_all(&parent).unwrap();
     }
 }

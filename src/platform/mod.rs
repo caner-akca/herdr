@@ -198,8 +198,10 @@ pub(crate) struct RemoteSshConfigPaths {
 
 #[cfg(unix)]
 mod unix_common;
+#[cfg(all(unix, test))]
+pub(crate) use unix_common::bind_local_listener_for_test;
 #[cfg(unix)]
-pub(crate) use unix_common::{begin_cli_output, end_cli_output};
+pub(crate) use unix_common::{begin_cli_output, bind_private_local_listener, end_cli_output};
 
 #[cfg(not(unix))]
 pub(crate) fn begin_cli_output() {}

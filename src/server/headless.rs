@@ -39,8 +39,7 @@ use crate::app;
 use crate::config;
 use crate::events::AppEvent;
 use crate::ipc::{
-    bind_local_listener, remove_socket_file_if_owned, socket_file_identity, LocalListener,
-    SocketFileIdentity,
+    remove_socket_file_if_owned, socket_file_identity, LocalListener, SocketFileIdentity,
 };
 use crate::protocol::{
     self, AttachScrollDirection, AttachScrollSource, FrameData, ServerMessage, MAX_FRAME_SIZE,
@@ -58,9 +57,7 @@ use crate::server::keybindings::{app_keybindings, apply_keybindings};
 use crate::server::notifications::{
     should_forward_toast_to_clients, toast_message_from_state_change, toast_notify_kind,
 };
-use crate::server::socket_paths::{
-    client_socket_path, prepare_socket_path, restrict_socket_permissions,
-};
+use crate::server::socket_paths::{client_socket_path, prepare_socket_path};
 use crate::server::terminal_attach::paste_payload_for_runtime;
 
 mod pane_graphics;
@@ -484,8 +481,7 @@ impl HeadlessServer {
         let client_path = client_socket_path();
         prepare_socket_path(&client_path)?;
 
-        let listener = bind_local_listener(&client_path)?;
-        restrict_socket_permissions(&client_path)?;
+        let listener = crate::ipc::bind_private_local_listener(&client_path)?;
         let client_socket_identity = socket_file_identity(&client_path)?;
         info!(path = %client_path.display(), "client protocol socket listening");
 
@@ -1482,8 +1478,7 @@ impl HeadlessServer {
 
         let client_path = client_socket_path();
         prepare_socket_path(&client_path)?;
-        let listener = bind_local_listener(&client_path)?;
-        restrict_socket_permissions(&client_path)?;
+        let listener = crate::ipc::bind_private_local_listener(&client_path)?;
         let client_socket_identity = socket_file_identity(&client_path)?;
         listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
 
@@ -5372,7 +5367,7 @@ mod tests {
         let _ = fs::create_dir_all(&dir);
         let socket_path = dir.join("client.sock");
         let _ = fs::remove_file(&socket_path);
-        let listener = bind_local_listener(&socket_path).expect("bind test listener");
+        let listener = crate::ipc::bind_local_listener(&socket_path).expect("bind test listener");
         let client_socket_identity =
             socket_file_identity(&socket_path).expect("test listener socket identity");
         #[cfg(unix)]
