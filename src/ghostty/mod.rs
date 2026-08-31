@@ -1115,6 +1115,8 @@ impl Terminal {
         (result == ffi::GhosttyResult_GHOSTTY_SUCCESS).then_some(point.y as usize)
     }
 
+    /// Resolves one screen coordinate, which can traverse the whole scrollback;
+    /// read several cells with `screen_text_rows_range` instead (refs #2592).
     pub fn screen_cell(&self, x: u16, y: u32) -> Result<(CellWide, Vec<u32>), Error> {
         let grid_ref = self.grid_ref(ghostty_screen_point(x, y))?;
         let wide = grid_ref_wide(&grid_ref)?;
