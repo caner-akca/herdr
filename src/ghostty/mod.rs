@@ -1140,7 +1140,10 @@ impl Terminal {
             let Some(y) = u32::try_from(y).ok() else {
                 break;
             };
-            let mut grid_ref = self.grid_ref(ghostty_screen_point(0, y))?;
+            // Resolve at the widest column we will read: `pin` rejects a page left
+            // narrower than the terminal by an incomplete reflow, so this validates the
+            // whole row before we walk `x` across it in place.
+            let mut grid_ref = self.grid_ref(ghostty_screen_point(cols.saturating_sub(1), y))?;
             let (soft_wrapped, wrap_continuation) = grid_ref_wrap_state(&grid_ref)?;
             let mut cells = Vec::with_capacity(usize::from(cols));
             for x in 0..cols {
