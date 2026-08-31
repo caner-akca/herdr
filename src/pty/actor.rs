@@ -1,3 +1,37 @@
+/// Why a pane refused input.
+///
+/// Herdr reports a refusal instead of half-delivering a write, so a caller
+/// that is told its input was accepted can rely on that (refs #2862).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PtyWriteError {
+    /// The pane is not accepting input: it was released, it is quiesced for a
+    /// handoff, or the actor's command queue is full.
+    Unavailable,
+    /// The foreground program is reading in canonical mode, whose input queue
+    /// caps a line at `limit` bytes and silently discards the rest. Delivering
+    /// the write would truncate it, so the pane refused it whole. ConPTY has
+    /// no such discipline, so Windows never reports this.
+    #[cfg(unix)]
+    LineExceedsCanonicalQueue { limit: usize },
+}
+
+impl std::fmt::Display for PtyWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unavailable => write!(f, "pane is not accepting input"),
+            #[cfg(unix)]
+            Self::LineExceedsCanonicalQueue { limit } => write!(
+                f,
+                "pane's foreground program is reading in canonical mode, which truncates \
+                 input lines longer than {limit} bytes; send shorter lines or retry once \
+                 the program takes over the terminal"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PtyWriteError {}
+
 #[cfg(unix)]
 mod unix;
 
@@ -58,32 +92,39 @@ mod windows {
     }
 
     impl PtyIoActorHandle {
+        /// ConPTY has no canonical line discipline of its own, so a write is
+        /// either accepted or refused outright (refs #2862).
         pub(crate) async fn write_user_input(
             &self,
             bytes: Bytes,
-        ) -> Result<(), mpsc::error::SendError<Bytes>> {
+        ) -> Result<(), super::PtyWriteError> {
             if !*self
                 .accepting
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
             {
-                return Err(mpsc::error::SendError(bytes));
+                return Err(super::PtyWriteError::Unavailable);
             }
-            self.data_tx.send(bytes).await
+            self.data_tx
+                .send(bytes)
+                .await
+                .map_err(|_| super::PtyWriteError::Unavailable)
         }
 
         pub(crate) fn try_write_user_input(
             &self,
             bytes: Bytes,
-        ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        ) -> Result<(), super::PtyWriteError> {
             if !*self
                 .accepting
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
             {
-                return Err(mpsc::error::TrySendError::Closed(bytes));
+                return Err(super::PtyWriteError::Unavailable);
             }
-            self.data_tx.try_send(bytes)
+            self.data_tx
+                .try_send(bytes)
+                .map_err(|_| super::PtyWriteError::Unavailable)
         }
 
         pub(crate) fn write_terminal_response(&self, response: impl FnOnce() -> Option<Bytes>) {

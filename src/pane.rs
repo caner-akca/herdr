@@ -21,7 +21,9 @@ use tracing::{error, info, warn};
 use crate::detect::{Agent, AgentState};
 use crate::events::AppEvent;
 use crate::layout::PaneId;
-use crate::pty::actor::{PtyIoActor, PtyIoActorConfig, PtyIoActorHandle, PtyReadResult};
+use crate::pty::actor::{
+    PtyIoActor, PtyIoActorConfig, PtyIoActorHandle, PtyReadResult, PtyWriteError,
+};
 use crate::render_signal::RenderSignal;
 
 mod agent_detection;
@@ -1175,19 +1177,24 @@ impl PaneRuntimeIo {
         }
     }
 
-    async fn send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::SendError<Bytes>> {
+    async fn send_bytes(&self, bytes: Bytes) -> Result<(), PtyWriteError> {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.write_user_input(bytes).await,
             #[cfg(test)]
-            PaneRuntimeIo::TestChannel { sender, .. } => sender.send(bytes).await,
+            PaneRuntimeIo::TestChannel { sender, .. } => sender
+                .send(bytes)
+                .await
+                .map_err(|_| PtyWriteError::Unavailable),
         }
     }
 
-    fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+    fn try_send_bytes(&self, bytes: Bytes) -> Result<(), PtyWriteError> {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.try_write_user_input(bytes),
             #[cfg(test)]
-            PaneRuntimeIo::TestChannel { sender, .. } => sender.try_send(bytes),
+            PaneRuntimeIo::TestChannel { sender, .. } => sender
+                .try_send(bytes)
+                .map_err(|_| PtyWriteError::Unavailable),
         }
     }
 
@@ -2849,11 +2856,11 @@ impl PaneRuntime {
             .encode_terminal_key(key, self.keyboard_protocol())
     }
 
-    pub async fn send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::SendError<Bytes>> {
+    pub async fn send_bytes(&self, bytes: Bytes) -> Result<(), PtyWriteError> {
         self.io.send_bytes(bytes).await
     }
 
-    pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+    pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), PtyWriteError> {
         self.io.try_send_bytes(bytes)
     }
 
@@ -2861,11 +2868,11 @@ impl PaneRuntime {
         self.io.send_bytes_after(bytes, delay);
     }
 
-    pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
+    pub async fn send_paste(&self, text: String) -> Result<(), PtyWriteError> {
         self.send_bytes(self.paste_payload(text)).await
     }
 
-    pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+    pub fn try_send_paste(&self, text: String) -> Result<(), PtyWriteError> {
         self.try_send_bytes(self.paste_payload(text))
     }
 

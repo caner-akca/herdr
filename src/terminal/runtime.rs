@@ -8,6 +8,7 @@ use tokio::sync::{mpsc, Notify};
 
 use crate::events::AppEvent;
 use crate::layout::PaneId;
+use crate::pty::actor::PtyWriteError;
 
 /// Live runtime for a server-owned terminal.
 ///
@@ -450,11 +451,11 @@ impl TerminalRuntime {
         self.0.encode_terminal_key(key)
     }
 
-    pub async fn send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::SendError<Bytes>> {
+    pub async fn send_bytes(&self, bytes: Bytes) -> Result<(), PtyWriteError> {
         self.0.send_bytes(bytes).await
     }
 
-    pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+    pub fn try_send_bytes(&self, bytes: Bytes) -> Result<(), PtyWriteError> {
         self.0.try_send_bytes(bytes)
     }
 
@@ -462,11 +463,11 @@ impl TerminalRuntime {
         self.0.send_bytes_after(bytes, delay);
     }
 
-    pub async fn send_paste(&self, text: String) -> Result<(), mpsc::error::SendError<Bytes>> {
+    pub async fn send_paste(&self, text: String) -> Result<(), PtyWriteError> {
         self.0.send_paste(text).await
     }
 
-    pub fn try_send_paste(&self, text: String) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+    pub fn try_send_paste(&self, text: String) -> Result<(), PtyWriteError> {
         self.0.try_send_paste(text)
     }
 

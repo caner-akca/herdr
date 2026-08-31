@@ -87,6 +87,29 @@ herdr
 
 Stopping the server exits its pane processes. Herdr panes inherit the long-lived server's macOS launch context, so a server started through SSH or a background job may not have access to interactive Keychain services. See [Herdr issue #966](https://github.com/herdrdev/herdr/issues/966) for details.
 
+## Long input is refused on macOS with `agent_start_input_failed`
+
+macOS caps a terminal input line at 1024 bytes, including its newline, while
+the foreground program is reading in canonical mode — a fresh pane before the
+shell finishes starting, or a shell busy running a command. The kernel keeps
+the first 1024 bytes of a longer line and silently discards the rest, so Herdr
+refuses the write instead of delivering a truncated command:
+
+```
+pane's foreground program is reading in canonical mode, which truncates input
+lines longer than 1024 bytes; send shorter lines or retry once the program
+takes over the terminal
+```
+
+This affects `herdr agent start ... -- <long args>`, `herdr pane run`, and
+pasted text — anything that composes a single line over 1024 bytes. The cap is
+per line, not per write, so multi-line input of any total size is unaffected.
+
+Interactive agents such as Claude Code put the terminal in raw mode and are not
+subject to the cap, so the usual remedy is to retry once the agent has taken
+over the pane. For a shell that stays in canonical mode, write long arguments
+to a script and run that instead of typing them.
+
 ## The `herdr` command is not found
 
 Restart the terminal so it reloads its environment, then confirm the Herdr install directory is on `PATH`. For package-manager installs, use that package manager to update Herdr and expose it on `PATH`. See [Install Herdr](/docs/install/#verify).

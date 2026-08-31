@@ -995,6 +995,121 @@ pub fn process_exists(pid: u32) -> bool {
     }
 }
 
+/// Capacity of Darwin's canonical input queue (`MAX_INPUT`/`MAX_CANON`).
+///
+/// The limit is per line and counts the terminator, so a 1024-byte line ending
+/// in a newline is delivered whole. A longer line is not rejected by the
+/// kernel: it keeps a byte-exact 1024-byte prefix, silently discards the rest,
+/// and still reports the whole `write()` as successful. That stranded prefix
+/// is the truncated fragment users report — a command cut mid-string with its
+/// closing quote lost (refs #2862).
+const DARWIN_MAX_CANONICAL_INPUT: usize = 1024;
+
+/// The bytes that end a canonical line under the discipline installed now.
+///
+/// Only the translations that can *lengthen* the line we measure are modelled,
+/// because only those produce a false "would truncate" verdict and refuse a
+/// write the kernel would have accepted. A translation we miss leaves the
+/// pre-existing behaviour untouched rather than losing data, so the exotic
+/// remainder of the discipline (`ISTRIP`, `PARMRK`, erase and kill processing)
+/// is deliberately not modelled here.
+struct CanonicalTerminators {
+    /// `IGNCR`: a carriage return is discarded before anything else sees it,
+    /// so it neither ends a line nor costs a byte. Takes precedence over
+    /// `ICRNL`.
+    ignore_cr: bool,
+    /// `ICRNL`: a carriage return arrives as a newline and ends the line.
+    cr_ends_line: bool,
+    /// `INLCR` rewrites a newline as a carriage return, which is not fed back
+    /// through `ICRNL`, so under it a newline stops ending lines.
+    nl_ends_line: bool,
+    /// `VEOL`, `VEOL2` and `VEOF` each end a line when not `_POSIX_VDISABLE`.
+    /// Darwin honours `VEOL2` regardless of `IEXTEN`.
+    eol: Option<u8>,
+    eol2: Option<u8>,
+    eof: Option<u8>,
+}
+
+impl CanonicalTerminators {
+    /// The terminators in force on `fd`, or `None` when input is not canonical.
+    /// The master and slave share one termios on Darwin, so the master fd
+    /// answers for the foreground program.
+    fn installed_on(fd: RawFd) -> Option<Self> {
+        let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: tcgetattr fills one termios for a valid fd. A failed read is
+        // reported as non-canonical, which keeps the write behaviour herdr had
+        // before this check existed.
+        let termios = unsafe {
+            if libc::tcgetattr(fd, termios.as_mut_ptr()) != 0 {
+                return None;
+            }
+            termios.assume_init()
+        };
+        if termios.c_lflag & libc::ICANON == 0 {
+            return None;
+        }
+        let control = |index: usize| match termios.c_cc[index] {
+            libc::_POSIX_VDISABLE => None,
+            byte => Some(byte),
+        };
+        Some(Self {
+            ignore_cr: termios.c_iflag & libc::IGNCR != 0,
+            cr_ends_line: termios.c_iflag & libc::ICRNL != 0,
+            nl_ends_line: termios.c_iflag & libc::INLCR == 0,
+            eol: control(libc::VEOL),
+            eol2: control(libc::VEOL2),
+            eof: control(libc::VEOF),
+        })
+    }
+
+    fn ends_line(&self, byte: u8) -> bool {
+        match byte {
+            b'\n' => self.nl_ends_line,
+            b'\r' => !self.ignore_cr && self.cr_ends_line,
+            byte => self.eol == Some(byte) || self.eol2 == Some(byte) || self.eof == Some(byte),
+        }
+    }
+
+    /// Whether any line in `bytes` outgrows the queue. A line left unterminated
+    /// at the end of the payload still counts: the queue fills as the bytes
+    /// arrive, not when the line is completed.
+    fn would_truncate(&self, bytes: &[u8]) -> bool {
+        let mut line = 0usize;
+        for &byte in bytes {
+            if byte == b'\r' && self.ignore_cr {
+                continue;
+            }
+            line += 1;
+            if line > DARWIN_MAX_CANONICAL_INPUT {
+                return true;
+            }
+            if self.ends_line(byte) {
+                line = 0;
+            }
+        }
+        false
+    }
+}
+
+/// Whether `bytes` is even large enough for the canonical queue to truncate
+/// it, answered without a descriptor. This is the shape of essentially every
+/// PTY write — a keystroke, a mouse report, a terminal response — so answering
+/// it first keeps the discipline read off that path entirely.
+pub(crate) fn may_exceed_canonical_queue(bytes: &[u8]) -> bool {
+    bytes.len() > DARWIN_MAX_CANONICAL_INPUT
+}
+
+/// The per-line byte cap the discipline installed on `fd` would silently
+/// enforce on `bytes`, or `None` when the write survives intact (refs #2862).
+pub(crate) fn canonical_truncation_limit(fd: RawFd, bytes: &[u8]) -> Option<usize> {
+    if !may_exceed_canonical_queue(bytes) {
+        return None;
+    }
+    CanonicalTerminators::installed_on(fd)
+        .filter(|terminators| terminators.would_truncate(bytes))
+        .map(|_| DARWIN_MAX_CANONICAL_INPUT)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1214,5 +1329,109 @@ printf '%s\n' "$@" > "$HERDR_NOTIFY_ARGS"
         assert_eq!(argv[1], "-c");
         assert!(argv[2].contains("EDITOR:-vi"));
         assert!(argv[2].contains("/tmp/herdr scrollback.txt"));
+    }
+
+    impl CanonicalTerminators {
+        /// Darwin's defaults for an interactive shell: ICRNL on, VEOF at
+        /// ^D, VEOL and VEOL2 left at `_POSIX_VDISABLE`.
+        fn test_defaults() -> Self {
+            Self {
+                ignore_cr: false,
+                cr_ends_line: true,
+                nl_ends_line: true,
+                eol: None,
+                eol2: None,
+                eof: Some(0x04),
+            }
+        }
+    }
+
+    fn line_of(len: usize) -> Vec<u8> {
+        vec![b'a'; len]
+    }
+
+    /// refs #2862: the cap is per line and counts the terminator. Verified
+    /// against XNU: a 1024-byte line arrives whole, a 1025-byte one strands a
+    /// 1024-byte prefix and loses the rest.
+    #[test]
+    fn canonical_line_budget_matches_the_kernel_boundary() {
+        let terminators = CanonicalTerminators::test_defaults();
+
+        let fits = [line_of(1023), vec![b'\n']].concat();
+        assert!(!terminators.would_truncate(&fits));
+        let over = [line_of(1024), vec![b'\n']].concat();
+        assert!(terminators.would_truncate(&over));
+
+        // The queue fills as bytes arrive, so an unterminated line counts too.
+        // This is the reported shape: a composed command typed before Enter.
+        assert!(!terminators.would_truncate(&line_of(1024)));
+        assert!(terminators.would_truncate(&line_of(1025)));
+    }
+
+    /// refs #2862: total size must not decide the verdict. Ordinary multi-line
+    /// input is far larger than the queue and the kernel accepts every byte of
+    /// it, so refusing on size alone would break normal pastes.
+    #[test]
+    fn total_size_does_not_decide_the_verdict() {
+        let terminators = CanonicalTerminators::test_defaults();
+        let many_short_lines: Vec<u8> = (0..10)
+            .flat_map(|_| [line_of(499), vec![b'\n']].concat())
+            .collect();
+        assert_eq!(many_short_lines.len(), 5000);
+        assert!(!terminators.would_truncate(&many_short_lines));
+    }
+
+    /// refs #2862: which byte ends a line follows the active termios, and only
+    /// a missed terminator can refuse a write the kernel would have taken.
+    #[test]
+    fn line_terminators_follow_the_active_termios() {
+        let split_by =
+            |separator: u8| [line_of(1000), vec![separator], line_of(1000), vec![b'\n']].concat();
+
+        // ICRNL decides whether a carriage return ends a line.
+        let mut terminators = CanonicalTerminators::test_defaults();
+        assert!(!terminators.would_truncate(&split_by(b'\r')));
+        terminators.cr_ends_line = false;
+        assert!(terminators.would_truncate(&split_by(b'\r')));
+
+        // IGNCR discards the carriage return before ICRNL sees it, so it ends
+        // nothing — but it costs no queue byte either.
+        let mut terminators = CanonicalTerminators::test_defaults();
+        terminators.ignore_cr = true;
+        assert!(terminators.would_truncate(&split_by(b'\r')));
+        assert!(!terminators.would_truncate(&[line_of(1024), vec![b'\r'; 64]].concat()));
+
+        // INLCR rewrites a newline as a carriage return and does not feed it
+        // back through ICRNL, so newlines stop ending lines.
+        let short_lines: Vec<u8> = (0..6)
+            .flat_map(|_| [line_of(499), vec![b'\n']].concat())
+            .collect();
+        assert!(!CanonicalTerminators::test_defaults().would_truncate(&short_lines));
+        let mut terminators = CanonicalTerminators::test_defaults();
+        terminators.nl_ends_line = false;
+        assert!(terminators.would_truncate(&short_lines));
+
+        // VEOL, VEOL2 and VEOF each end a line when enabled; Darwin honours
+        // VEOL2 without IEXTEN. A control left disabled ends nothing.
+        assert!(!CanonicalTerminators::test_defaults().would_truncate(&split_by(0x04)));
+        assert!(CanonicalTerminators::test_defaults().would_truncate(&split_by(0x02)));
+        for assign in [
+            |t: &mut CanonicalTerminators| t.eol = Some(0x02),
+            |t: &mut CanonicalTerminators| t.eol2 = Some(0x02),
+        ] {
+            let mut terminators = CanonicalTerminators::test_defaults();
+            assign(&mut terminators);
+            assert!(!terminators.would_truncate(&split_by(0x02)));
+        }
+    }
+
+    /// refs #2862: a payload that cannot outgrow the queue is cleared without
+    /// reading the discipline at all, which keeps the check off the path every
+    /// keystroke and terminal response takes.
+    #[test]
+    fn writes_within_the_queue_skip_the_discipline_read() {
+        // An invalid fd would fail tcgetattr, so reaching it changes nothing
+        // here; the point is that a short write is answered before that.
+        assert_eq!(canonical_truncation_limit(-1, &line_of(1024)), None);
     }
 }

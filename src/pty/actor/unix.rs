@@ -12,12 +12,22 @@ use tracing::{debug, warn};
 
 use crate::pty::fd;
 
+use super::PtyWriteError;
+
 // Actor handle methods must call wake_actor() after queuing work. The idle
 // timeout is only a fallback for missed wakes; PTY and wake readiness drive
 // normal responsiveness.
 const ACTOR_IDLE_POLL_MS: i32 = 1000;
 const ACTOR_COMMAND_BUFFER: usize = 1024;
 const HANDOFF_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long a submission waits for the runner's line-discipline verdict before
+/// being written unchecked (refs #2862).
+///
+/// The runner is a dedicated thread that answers on its next loop pass, so this
+/// normally costs microseconds and only a submission too large to be a
+/// keystroke ever waits at all. The bound exists so a runner buried in output
+/// cannot stall the caller, which may be a runtime worker.
+const CANONICAL_VERDICT_TIMEOUT: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActorState {
@@ -77,6 +87,12 @@ enum PtyIoDataCommand {
 
 enum PtyIoControlCommand {
     BeginHandoff(std_mpsc::Sender<std::io::Result<()>>),
+    /// Ask the runner, which holds the pane's only master fd, whether the line
+    /// discipline installed right now would truncate this submission.
+    CanonicalTruncationLimit {
+        bytes: Bytes,
+        reply: std_mpsc::Sender<Option<usize>>,
+    },
     DuplicateForHandoff(std_mpsc::Sender<std::io::Result<RawFd>>),
     ForegroundProcessGroup(std_mpsc::Sender<Option<u32>>),
     RollbackHandoff(std_mpsc::Sender<std::io::Result<()>>),
@@ -100,23 +116,61 @@ struct UserWriteGate {
 }
 
 impl PtyIoActorHandle {
-    pub(crate) async fn write_user_input(
-        &self,
-        bytes: Bytes,
-    ) -> Result<(), mpsc::error::SendError<Bytes>> {
+    /// Refuse input the line discipline installed right now would silently
+    /// truncate, so the caller learns the write did not land instead of being
+    /// told it succeeded (refs #2862).
+    ///
+    /// The runner holds the pane's only master fd — handoff depends on that —
+    /// so the verdict is asked of the runner rather than read here. The
+    /// question is only worth asking for a submission large enough to be
+    /// truncated at all, which excludes every keystroke, mouse report and
+    /// terminal response, so the common write never pays for this.
+    ///
+    /// The discipline can change between the verdict and the write. That race
+    /// costs a refusal the kernel would have accepted, which the caller can
+    /// retry; it never costs delivered bytes.
+    fn reject_if_discipline_would_truncate(&self, bytes: &Bytes) -> Result<(), PtyWriteError> {
+        if !crate::platform::may_exceed_canonical_queue(bytes) {
+            return Ok(());
+        }
+        let (reply, verdict) = std_mpsc::channel();
+        if self
+            .control_tx
+            .send(PtyIoControlCommand::CanonicalTruncationLimit {
+                bytes: bytes.clone(),
+                reply,
+            })
+            .is_err()
+        {
+            return Err(PtyWriteError::Unavailable);
+        }
+        self.wake_actor();
+        // A runner too busy to answer leaves the write to the behaviour it had
+        // before this check existed rather than refusing on a guess. The gate
+        // above is already closed during a handoff drain, which is the only
+        // place the runner stays away from its control channel for long.
+        match verdict.recv_timeout(CANONICAL_VERDICT_TIMEOUT) {
+            Ok(Some(limit)) => Err(PtyWriteError::LineExceedsCanonicalQueue { limit }),
+            Ok(None) => Ok(()),
+            Err(_) => Ok(()),
+        }
+    }
+
+    pub(crate) async fn write_user_input(&self, bytes: Bytes) -> Result<(), PtyWriteError> {
         {
             let user_writes = self
                 .user_writes
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             if !user_writes.accepting {
-                return Err(mpsc::error::SendError(bytes));
+                return Err(PtyWriteError::Unavailable);
             }
         }
+        self.reject_if_discipline_would_truncate(&bytes)?;
 
         let permit = match self.data_tx.reserve().await {
             Ok(permit) => permit,
-            Err(_) => return Err(mpsc::error::SendError(bytes)),
+            Err(_) => return Err(PtyWriteError::Unavailable),
         };
 
         let user_writes = self
@@ -124,24 +178,22 @@ impl PtyIoActorHandle {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !user_writes.accepting {
-            return Err(mpsc::error::SendError(bytes));
+            return Err(PtyWriteError::Unavailable);
         }
         permit.send(PtyIoDataCommand::WriteUserInput(bytes));
         self.wake_actor();
         Ok(())
     }
 
-    pub(crate) fn try_write_user_input(
-        &self,
-        bytes: Bytes,
-    ) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+    pub(crate) fn try_write_user_input(&self, bytes: Bytes) -> Result<(), PtyWriteError> {
         let user_writes = self
             .user_writes
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if !user_writes.accepting {
-            return Err(mpsc::error::TrySendError::Closed(bytes));
+            return Err(PtyWriteError::Unavailable);
         }
+        self.reject_if_discipline_would_truncate(&bytes)?;
         match self
             .data_tx
             .try_send(PtyIoDataCommand::WriteUserInput(bytes))
@@ -150,12 +202,7 @@ impl PtyIoActorHandle {
                 self.wake_actor();
                 Ok(())
             }
-            Err(mpsc::error::TrySendError::Full(PtyIoDataCommand::WriteUserInput(bytes))) => {
-                Err(mpsc::error::TrySendError::Full(bytes))
-            }
-            Err(mpsc::error::TrySendError::Closed(PtyIoDataCommand::WriteUserInput(bytes))) => {
-                Err(mpsc::error::TrySendError::Closed(bytes))
-            }
+            Err(_) => Err(PtyWriteError::Unavailable),
         }
     }
 
@@ -361,7 +408,6 @@ impl PtyIoActor {
     ) -> std::io::Result<PtyIoActorHandle> {
         fd::set_cloexec(config.master_fd.as_raw_fd())?;
         fd::set_nonblocking(config.master_fd.as_raw_fd())?;
-
         let (data_tx, data_rx) = mpsc::channel(ACTOR_COMMAND_BUFFER);
         let (control_tx, control_rx) = std_mpsc::channel();
         let wake_pipe = fd::create_wake_pipe()?;
@@ -557,6 +603,12 @@ impl PtyIoActorRunner {
             PtyIoControlCommand::BeginHandoff(reply) => {
                 let result = self.begin_handoff();
                 let _ = reply.send(result);
+            }
+            PtyIoControlCommand::CanonicalTruncationLimit { bytes, reply } => {
+                let _ = reply.send(crate::platform::canonical_truncation_limit(
+                    self.file.as_raw_fd(),
+                    &bytes,
+                ));
             }
             PtyIoControlCommand::DuplicateForHandoff(reply) => {
                 let result = if self.state == ActorState::Quiesced {
@@ -1365,7 +1417,7 @@ mod tests {
         let err = write.await.expect("write task joins").expect_err(
             "write waiting for capacity must be rejected after handoff closes the input gate",
         );
-        assert_eq!(err.0, Bytes::from_static(b"after-handoff-start"));
+        assert_eq!(err, PtyWriteError::Unavailable);
         match tokio::time::timeout(Duration::from_millis(50), data_rx.recv()).await {
             Err(_) | Ok(None) => {}
             Ok(Some(_)) => panic!("rejected write must not be queued"),
@@ -1459,5 +1511,199 @@ mod tests {
 
         let _ = peer.write_all(b"ignored");
         assert!(read_rx.recv_timeout(Duration::from_millis(150)).is_err());
+    }
+
+    /// A PTY whose slave is in canonical mode with echo off, the shape a shell
+    /// leaves behind while a foreground program reads a line.
+    #[cfg(target_os = "macos")]
+    fn canonical_test_pty() -> (OwnedFd, OwnedFd, libc::termios) {
+        let mut master_fd = 0;
+        let mut slave_fd = 0;
+        // SAFETY: openpty fills both descriptors or reports failure; the
+        // remaining arguments are optional and left null.
+        let opened = unsafe {
+            libc::openpty(
+                &mut master_fd,
+                &mut slave_fd,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(opened, 0, "open PTY: {}", std::io::Error::last_os_error());
+        // SAFETY: openpty just handed us both descriptors and kept no copy.
+        let master_fd = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(master_fd) };
+        // SAFETY: as above.
+        let slave_fd = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(slave_fd) };
+
+        let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: tcgetattr fills one termios for the slave we just opened.
+        let read = unsafe { libc::tcgetattr(slave_fd.as_raw_fd(), termios.as_mut_ptr()) };
+        assert_eq!(
+            read,
+            0,
+            "read PTY settings: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: tcgetattr reported success, so the value is initialized.
+        let mut termios = unsafe { termios.assume_init() };
+        termios.c_lflag |= libc::ICANON;
+        termios.c_lflag &= !libc::ECHO;
+        // SAFETY: writes the termios we just read back to the same fd.
+        let written = unsafe { libc::tcsetattr(slave_fd.as_raw_fd(), libc::TCSANOW, &termios) };
+        assert_eq!(
+            written,
+            0,
+            "set canonical mode: {}",
+            std::io::Error::last_os_error()
+        );
+        (master_fd, slave_fd, termios)
+    }
+
+    /// Take the slave out of canonical mode, the way a program does when it
+    /// takes over the terminal, and drain what the actor delivered.
+    #[cfg(target_os = "macos")]
+    fn leave_canonical_and_drain(
+        slave_fd: OwnedFd,
+        termios: &mut libc::termios,
+        expected_len: usize,
+        patience: Duration,
+    ) -> Vec<u8> {
+        termios.c_lflag &= !libc::ICANON;
+        termios.c_cc[libc::VMIN] = 0;
+        termios.c_cc[libc::VTIME] = 1;
+        // SAFETY: writes a termios read from this same fd back to it.
+        let written = unsafe { libc::tcsetattr(slave_fd.as_raw_fd(), libc::TCSANOW, termios) };
+        assert_eq!(
+            written,
+            0,
+            "set raw read mode: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut slave = std::fs::File::from(slave_fd);
+        let mut received = Vec::new();
+        let deadline = Instant::now() + patience;
+        while received.len() < expected_len && Instant::now() < deadline {
+            let mut chunk = [0u8; 4096];
+            match slave.read(&mut chunk) {
+                Ok(0) => {}
+                Ok(read) => received.extend_from_slice(&chunk[..read]),
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) => panic!("read slave: {err}"),
+            }
+        }
+        received
+    }
+
+    #[cfg(target_os = "macos")]
+    fn spawn_actor_on(master_fd: OwnedFd) -> PtyIoActorHandle {
+        PtyIoActor::spawn(PtyIoActorConfig {
+            pane_id: 1,
+            master_fd,
+            initially_quiesced: false,
+            on_read: Box::new(|_| PtyReadResult::empty()),
+            on_reader_exit: None,
+        })
+        .expect("actor spawn")
+    }
+
+    /// refs #2862: the reported failure. A composed command longer than the
+    /// canonical queue used to be accepted, truncated at 1024 bytes by the
+    /// kernel, and reported as delivered. It is now refused, and the refusal
+    /// names the cap so `agent start` can surface it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn oversized_canonical_line_is_refused_instead_of_truncated() {
+        let (master_fd, slave_fd, mut termios) = canonical_test_pty();
+        let handle = spawn_actor_on(master_fd);
+
+        let submitted = vec![b'A'; 1400];
+        let err = handle
+            .try_write_user_input(Bytes::copy_from_slice(&submitted))
+            .expect_err("input the canonical queue would truncate must be refused");
+        assert_eq!(
+            err,
+            PtyWriteError::LineExceedsCanonicalQueue { limit: 1024 }
+        );
+
+        // Nothing may reach the slave: a refusal that still delivered a
+        // truncated prefix would leave the shell at a `quote>` continuation,
+        // which is the symptom this refusal exists to prevent.
+        // Nothing is expected, so wait only long enough for a delivery the
+        // actor would have made immediately.
+        let leaked =
+            leave_canonical_and_drain(slave_fd, &mut termios, 1, Duration::from_millis(250));
+        handle.shutdown();
+        assert!(
+            leaked.is_empty(),
+            "refused input must not be partially delivered, got {} bytes",
+            leaked.len()
+        );
+    }
+
+    /// refs #2862: the refusal is about the discipline installed now, not the
+    /// payload, so the same input is delivered whole once the foreground
+    /// program takes over the terminal. Retrying is the documented remedy.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_same_input_is_accepted_once_the_program_leaves_canonical_mode() {
+        let (master_fd, slave_fd, mut termios) = canonical_test_pty();
+        let handle = spawn_actor_on(master_fd);
+
+        let submitted = vec![b'A'; 1400];
+        handle
+            .try_write_user_input(Bytes::copy_from_slice(&submitted))
+            .expect_err("refused while canonical");
+
+        termios.c_lflag &= !libc::ICANON;
+        // SAFETY: writes a termios read from this same fd back to it.
+        let written = unsafe { libc::tcsetattr(slave_fd.as_raw_fd(), libc::TCSANOW, &termios) };
+        assert_eq!(
+            written,
+            0,
+            "leave canonical mode: {}",
+            std::io::Error::last_os_error()
+        );
+
+        handle
+            .try_write_user_input(Bytes::copy_from_slice(&submitted))
+            .expect("a raw-mode program accepts input of any length");
+
+        let received = leave_canonical_and_drain(
+            slave_fd,
+            &mut termios,
+            submitted.len(),
+            Duration::from_secs(3),
+        );
+        handle.shutdown();
+        assert_eq!(received, submitted, "the retried input must arrive whole");
+    }
+
+    /// refs #2862: only an over-long *line* is refused. Ordinary multi-line
+    /// input dwarfs the queue and the kernel takes every byte, so refusing on
+    /// total size would break normal pastes into a canonical reader.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn short_lined_input_larger_than_the_queue_is_accepted_while_canonical() {
+        let (master_fd, slave_fd, mut termios) = canonical_test_pty();
+        let handle = spawn_actor_on(master_fd);
+
+        let submitted: Vec<u8> = (0..6)
+            .flat_map(|_| [vec![b'A'; 499], vec![b'\n']].concat())
+            .collect();
+        assert_eq!(submitted.len(), 3000, "payload far exceeds the 1024 queue");
+        handle
+            .try_write_user_input(Bytes::copy_from_slice(&submitted))
+            .expect("short-lined input must not be refused");
+
+        let received = leave_canonical_and_drain(
+            slave_fd,
+            &mut termios,
+            submitted.len(),
+            Duration::from_secs(3),
+        );
+        handle.shutdown();
+        assert_eq!(received, submitted, "every line must be delivered");
     }
 }

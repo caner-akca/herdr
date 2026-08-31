@@ -132,6 +132,26 @@ pub(crate) fn take_terminal_resize_signal() -> bool {
     false
 }
 
+/// The per-line byte cap that the line discipline installed on `fd` would
+/// silently enforce on `bytes`, or `None` when the write survives intact.
+///
+/// Only Darwin's canonical discipline truncates silently: it caps a line at
+/// 1024 bytes including its terminator, keeps that prefix, discards the rest,
+/// and still reports the whole `write()` as successful (refs #2862). Every
+/// other Unix delivers the write intact.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn canonical_truncation_limit(_fd: std::os::fd::RawFd, _bytes: &[u8]) -> Option<usize> {
+    None
+}
+
+/// Whether `bytes` is even large enough for a line discipline to truncate it,
+/// answered without a descriptor so a caller can skip asking about the
+/// overwhelming majority of writes. Only Darwin has such a cap.
+#[cfg(all(unix, not(target_os = "macos")))]
+pub(crate) fn may_exceed_canonical_queue(_bytes: &[u8]) -> bool {
+    false
+}
+
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipboardCommand {
