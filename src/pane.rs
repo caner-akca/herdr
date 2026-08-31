@@ -4062,6 +4062,10 @@ mod tests {
                 pending_foreground_shell_clear: true,
                 ..quiet
             },
+            ProcessProbeInput {
+                pending_shell_exit_confirmation: true,
+                ..quiet
+            },
         ] {
             assert!(observe(false, false, std::time::Duration::ZERO, immediate));
         }
@@ -4145,6 +4149,81 @@ mod tests {
             pending_restore_probe: true,
             ..process_probe_input()
         }));
+    }
+
+    #[test]
+    fn pending_shell_exit_confirmation_forces_a_fast_recheck() {
+        // refs #3225: a pending confirmation must be resolved by the next ~300ms
+        // probe. If it fell back to PROCESS_RECHECK_IDENTIFIED or was skipped
+        // under lifecycle authority, a genuine exit would be reported seconds late.
+        let pending = ProcessProbeInput {
+            current_agent: Some(Agent::Pi),
+            pending_shell_exit_confirmation: true,
+            elapsed_since_process_check: std::time::Duration::ZERO,
+            ..process_probe_input()
+        };
+        let settled = ProcessProbeInput {
+            pending_shell_exit_confirmation: false,
+            ..pending
+        };
+
+        assert!(should_probe_foreground_job(pending));
+        assert!(!should_probe_foreground_job(settled));
+        assert!(!should_skip_process_probe_for_lifecycle_authority(
+            true, pending
+        ));
+        assert!(should_skip_process_probe_for_lifecycle_authority(
+            true,
+            ProcessProbeInput {
+                elapsed_since_process_check: PROCESS_RECHECK_IDENTIFIED,
+                ..settled
+            }
+        ));
+    }
+
+    #[test]
+    fn shell_exit_confirmation_costs_at_most_one_extra_probe_tick() {
+        // refs #3225: the streak resolves on the next observation, so the forced
+        // recheck above cannot persist across ticks or scale with pane count.
+        let mut presence = AgentDetectionPresence::from_agent(Some(Agent::Pi));
+        let mut pending_clear = false;
+        let mut exit_reported = false;
+        let mut streak = 0u8;
+
+        let first =
+            foreground_shell_agent_action(Some(Agent::Pi), None, true, exit_reported, streak);
+        assert_eq!(first, ForegroundShellAgentAction::ConfirmShellObservation);
+        apply_foreground_shell_agent_action(
+            &mut presence,
+            first,
+            Some(Agent::Pi),
+            None,
+            &mut pending_clear,
+            &mut exit_reported,
+            &mut streak,
+        );
+        assert_eq!(streak, 1);
+
+        let second =
+            foreground_shell_agent_action(Some(Agent::Pi), None, true, exit_reported, streak);
+        assert_eq!(second, ForegroundShellAgentAction::ReportProcessExit);
+        apply_foreground_shell_agent_action(
+            &mut presence,
+            second,
+            Some(Agent::Pi),
+            None,
+            &mut pending_clear,
+            &mut exit_reported,
+            &mut streak,
+        );
+        assert_eq!(
+            streak, 0,
+            "the confirmation must stop forcing probes once it resolves"
+        );
+        assert!(
+            pending_clear,
+            "the exit still hands off to the existing pending-clear probe"
+        );
     }
 
     #[test]

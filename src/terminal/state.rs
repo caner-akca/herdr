@@ -1346,7 +1346,7 @@ impl TerminalState {
     fn session_start_source_is_recognized(session_start_source: Option<&str>) -> bool {
         matches!(
             session_start_source,
-            Some("startup" | "clear" | "resume" | "compact" | "new" | "fork" | "select" | "reload")
+            Some("startup" | "clear" | "resume" | "compact" | "new" | "fork" | "select")
         )
     }
 
@@ -1390,6 +1390,16 @@ impl TerminalState {
         let process_present = known_agent.is_some()
             && self.detected_agent == known_agent
             && self.recent_agent_process_exit.is_none();
+        // A `reload` session start is a live process re-anchoring its existing
+        // session, so a recorded process exit for the same detected agent was a
+        // false observation (refs #3225). Only this recovery accepts `reload`;
+        // `session_start_source_is_recognized` stays narrow so reload cannot
+        // widen generic session-owner arbitration.
+        let reload_confirms_live_process = session_start_source.as_deref() == Some("reload")
+            && self.detected_agent == known_agent
+            && self
+                .recent_agent_process_exit
+                .is_some_and(|exit| Some(exit.agent) == known_agent);
         let full_lifecycle_source =
             crate::detect::full_lifecycle_hook_authority(&source, &agent_label);
         let generation_gated = self
@@ -1446,7 +1456,9 @@ impl TerminalState {
             && !selection_can_reconcile
             && (!process_present || generation_gated || !session_anchored)
         {
-            if !Self::session_start_source_is_recognized(session_start_source.as_deref()) {
+            if !Self::session_start_source_is_recognized(session_start_source.as_deref())
+                && !reload_confirms_live_process
+            {
                 return None;
             }
             let seq = seq?;
@@ -1489,21 +1501,17 @@ impl TerminalState {
                 suppressed.replacement_session_ref = Some(session_ref);
             }
             self.hook_report_sequences.insert(source.clone(), seq);
-            // A `reload` session start is a live process re-anchoring its
-            // existing session, so a recorded process exit for the same
-            // detected agent was a false observation. Drop it so the live
-            // agent's effective label (and its `agent list` registration) is
-            // restored (refs #3225). Other session-start reasons (such as
+            // Drop the false exit so the live agent's effective label (and its
+            // `agent list` registration) is restored, then take the process-present
+            // path below so the transition is published as a mutation instead of
+            // mutating state behind a `None`. Other session-start reasons (such as
             // `startup`) can follow a genuine exit and keep the existing
             // replay-on-process-evidence flow.
-            if session_start_source.as_deref() == Some("reload")
-                && known_agent.is_some()
-                && self.detected_agent == known_agent
-            {
+            if reload_confirms_live_process {
                 self.recent_agent_process_exit = None;
             }
 
-            if process_present {
+            if process_present || reload_confirms_live_process {
                 self.clear_full_lifecycle_hook_suppression_for_detected_agent(None, known_agent);
                 let current_session = self.current_session_identity_for_persistence();
                 return Some(TerminalStateMutation {
@@ -2879,7 +2887,7 @@ mod tests {
     }
 
     #[test]
-    fn issue_3225_false_exit_loses_live_pi_registration() {
+    fn issue_3225_reload_restores_live_pi_registration_after_false_exit() {
         let now = Instant::now();
         let mut terminal = test_terminal();
         let session_ref =
@@ -2933,6 +2941,23 @@ mod tests {
             // if `reload` stops surviving the API path, not just the arbitration.
             crate::agent_resume::normalize_session_start_source(Some("reload".into())),
         );
+        let reload = reload.expect("a reload from a live Pi should publish a mutation");
+        assert!(
+            reload.effective_state_change.is_some(),
+            "the restored Pi label must reach clients as an effective state change"
+        );
+        assert!(reload.session_ref_changed);
+        assert!(!reload.agent_released);
+        assert_eq!(
+            terminal
+                .persisted_agent_session
+                .as_ref()
+                .map(|session| (session.source.as_str(), session.agent.as_str())),
+            Some(("herdr:pi", "pi")),
+            "the reload must restore the session the false exit dropped"
+        );
+        assert!(terminal.is_agent_terminal());
+
         let working = terminal.set_hook_authority_at(
             "herdr:pi".into(),
             "pi".into(),
@@ -2943,14 +2968,68 @@ mod tests {
             now + Duration::from_secs(2),
         );
 
-        assert!(reload.is_none());
-        assert!(working.is_none());
-        assert!(terminal.hook_authority.is_none());
-        assert!(terminal.persisted_agent_session.is_none());
+        assert!(
+            working.is_some(),
+            "the next working report must be accepted once the false exit is cleared"
+        );
+        assert_eq!(
+            terminal
+                .hook_authority
+                .as_ref()
+                .map(|authority| (authority.agent_label.as_str(), authority.state)),
+            Some(("pi", AgentState::Working)),
+            "lifecycle authority must be live again, not buffered behind the exit"
+        );
+        assert_eq!(terminal.state, AgentState::Working);
         assert!(
             terminal.is_agent_terminal(),
             "a live Pi should re-register after a false process-exit observation"
         );
+    }
+
+    #[test]
+    fn reload_does_not_take_over_a_different_session_owner() {
+        // refs #3225: `reload` exists here only to recover a false process exit
+        // for the already detected agent. It must not widen generic session-owner
+        // arbitration, which `session_report_allows_session_replacement`
+        // deliberately denies it. `startup` still takes over, so this pins the
+        // narrowing rather than the takeover path itself.
+        for (start_source, expected_owner) in [
+            (Some("reload"), ("herdr:codex", "codex")),
+            (Some("startup"), ("herdr:hermes", "hermes")),
+        ] {
+            let mut terminal = test_terminal();
+            terminal.set_detected_state(Some(Agent::Hermes), AgentState::Idle);
+            terminal.set_persisted_agent_session(crate::agent_resume::PersistedAgentSession {
+                source: "herdr:codex".into(),
+                agent: "codex".into(),
+                session_ref: crate::agent_resume::AgentSessionRef::id("codex-root")
+                    .expect("test session id should be valid"),
+            });
+
+            let report = terminal.set_agent_session_ref_for_session_start(
+                "herdr:hermes".into(),
+                "hermes".into(),
+                crate::agent_resume::AgentSessionRef::id("hermes-root"),
+                Some(11),
+                crate::agent_resume::normalize_session_start_source(
+                    start_source.map(str::to_string),
+                ),
+            );
+
+            assert_eq!(
+                report.is_some(),
+                start_source == Some("startup"),
+                "{start_source:?} must not decide session ownership like a recognized start"
+            );
+            assert_eq!(
+                terminal
+                    .persisted_agent_session
+                    .as_ref()
+                    .map(|session| (session.source.as_str(), session.agent.as_str())),
+                Some(expected_owner)
+            );
+        }
     }
 
     #[test]

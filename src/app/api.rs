@@ -2046,6 +2046,111 @@ mod tests {
     }
 
     #[test]
+    fn reload_after_a_false_process_exit_republishes_agent_registration() {
+        // refs #3225: a false exit releases a live agent, and the reload that the
+        // agent sends next must reach event subscribers as a re-registration, not
+        // only restore the label for direct `agent list` polling. The sequence
+        // mirrors what the pi integration emits on reload: session report first,
+        // then the state report.
+        let event_hub = crate::api::EventHub::default();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            true,
+            None,
+            api_rx,
+            event_hub.clone(),
+        );
+        let workspace = crate::workspace::Workspace::test_new("false-exit-reload");
+        let pane_id = workspace.tabs[0].root_pane;
+        let terminal_id = workspace.terminal_id(pane_id).cloned().unwrap();
+        app.state.workspaces = vec![workspace];
+        app.state.ensure_test_terminals();
+        let observed_at = std::time::Instant::now();
+        let session_ref = crate::agent_resume::AgentSessionRef::id("issue-3225-pi").unwrap();
+        let terminal = app.state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.set_detected_state(Some(Agent::Pi), AgentState::Idle);
+        terminal
+            .set_agent_session_ref_for_session_start(
+                "herdr:pi".into(),
+                "pi".into(),
+                Some(session_ref.clone()),
+                Some(20),
+                Some("new".into()),
+            )
+            .unwrap();
+        terminal
+            .set_hook_authority_at(
+                "herdr:pi".into(),
+                "pi".into(),
+                AgentState::Working,
+                None,
+                Some(session_ref.clone()),
+                Some(21),
+                observed_at,
+            )
+            .unwrap();
+
+        app.handle_internal_event(AppEvent::StateChanged {
+            pane_id,
+            agent: Some(Agent::Pi),
+            state: AgentState::Idle,
+            visible_blocker: false,
+            visible_working: false,
+            process_exited: true,
+            observed_at: observed_at + std::time::Duration::from_secs(1),
+        });
+
+        let released = event_hub.events_after(0);
+        assert!(released.iter().any(|(_, event)| matches!(
+            event.data,
+            crate::api::schema::EventData::PaneAgentDetected { released: true, .. }
+        )));
+        let after_release = released.last().map(|(sequence, _)| *sequence).unwrap_or(0);
+
+        app.handle_internal_event(AppEvent::AgentSessionReported {
+            pane_id,
+            source: "herdr:pi".into(),
+            agent_label: "pi".into(),
+            seq: Some(22),
+            session_ref: Some(session_ref.clone()),
+            session_start_source: crate::agent_resume::normalize_session_start_source(Some(
+                "reload".into(),
+            )),
+        });
+
+        assert!(
+            event_hub
+                .events_after(after_release)
+                .iter()
+                .any(|(_, event)| matches!(
+                    &event.data,
+                    crate::api::schema::EventData::PaneAgentDetected {
+                        agent: Some(agent),
+                        released: false,
+                        ..
+                    } if agent == "pi"
+                )),
+            "subscribers told the agent was released must be told it came back"
+        );
+
+        app.handle_internal_event(AppEvent::HookStateReported {
+            pane_id,
+            source: "herdr:pi".into(),
+            agent_label: "pi".into(),
+            state: AgentState::Working,
+            message: None,
+            seq: Some(23),
+            session_ref: Some(session_ref),
+        });
+
+        let terminal = &app.state.terminals[&terminal_id];
+        assert!(terminal.is_agent_terminal());
+        assert_eq!(terminal.state, AgentState::Working);
+        assert!(terminal.full_lifecycle_hook_authority_active());
+    }
+
+    #[test]
     fn overlay_exit_layout_updated_uses_restored_zoom_state() {
         let event_hub = crate::api::EventHub::default();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
