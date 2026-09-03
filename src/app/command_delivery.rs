@@ -1,23 +1,16 @@
 //! Delivering a composed command into a pane without typing an over-long line.
 //!
-//! herdr runs a command in a pane by typing it at the pane's shell. A terminal
-//! in canonical mode assembles one input line in a fixed-size buffer and hands
-//! the reader nothing until a terminator arrives, so a line longer than that
-//! buffer cannot be delivered at all: the kernel keeps a prefix, silently
-//! discards the rest, and still reports the whole `write()` as successful
-//! (refs #2862).
+//! A terminal in canonical mode assembles one input line in a fixed-size buffer
+//! and hands the reader nothing until a terminator arrives, so a longer line is
+//! never delivered: the kernel keeps a prefix, discards the rest, and still
+//! reports the whole `write()` as successful (refs #2862).
 //!
-//! Canonical mode is the default rather than an edge case. `bash` and `zsh`
-//! clear it only while their line editor is reading and restore it for the
-//! whole duration of every foreground command, and `dash` -- `/bin/sh` on
-//! Ubuntu -- never leaves it at all. So herdr can neither wait the condition
-//! out nor detect its way around it; the only reliable move is to keep the
-//! typed line short.
-//!
-//! A command that would be too long is written to a file instead, and herdr
-//! types a line that sources it. That typed line is a function of the path,
-//! not of the payload, so it is the same length for a one kilobyte prompt and
-//! a one megabyte one.
+//! Canonical mode is the default, not an edge case. `bash` and `zsh` leave it
+//! only while their line editor reads, and `dash` -- `/bin/sh` on Ubuntu --
+//! never leaves it at all, so herdr can neither wait the condition out nor
+//! detect its way around it. An over-long command is written to a file and
+//! sourced instead, which makes the typed line a function of the path length
+//! rather than the payload's.
 
 use std::io;
 #[cfg(unix)]
@@ -36,9 +29,7 @@ use std::path::PathBuf;
 #[cfg(unix)]
 const MAX_TYPED_COMMAND: usize = 512;
 
-/// A command staged for delivery to a pane.
 pub(crate) struct StagedCommand {
-    /// The text herdr should type.
     pub(crate) text: String,
     /// The payload file backing `text`, when the command was too long to type.
     payload: Option<PathBuf>,
@@ -88,12 +79,24 @@ fn stage_in(dir: &Path, command: &str, shell_name: &str, label: &str) -> io::Res
     use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+    let Some(keyword) = crate::platform::shell_source_keyword(shell_name) else {
+        // Staging would hand this shell a line it cannot run, which is worse
+        // than the truncation it replaces: a command under the line cap works
+        // today. Leave it typed and say so.
+        tracing::warn!(
+            shell = %shell_name,
+            bytes = command.len(),
+            "typing a command that may exceed the terminal line limit: herdr cannot source a file in this shell"
+        );
+        return Ok(StagedCommand::typed(command));
+    };
+
     std::fs::create_dir_all(dir)?;
     std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
 
     let path = dir.join(payload_name(label));
-    let quoted = shell_path(&path, shell_name)?;
-    let remove = shell_command(&["rm", "-f", "--", &quoted], shell_name)?;
+    let path_arg = shell_path(&path)?;
+    let remove = shell_command(&["rm", "-f", "--", &path_arg], shell_name)?;
 
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -107,13 +110,17 @@ fn stage_in(dir: &Path, command: &str, shell_name: &str, label: &str) -> io::Res
     writeln!(file, "{command}")?;
     file.sync_all()?;
 
-    let keyword = if shell_name.contains("fish") {
-        // fish dropped `.` as a source alias.
-        "source"
-    } else {
-        "."
-    };
-    let text = shell_command(&[keyword, &quoted], shell_name)?;
+    let text = shell_command(&[keyword, &path_arg], shell_name)?;
+    // The typed line is bounded by the path, not the payload, but a state
+    // directory near PATH_MAX could still overrun the cap. Fail loudly rather
+    // than type a line the line discipline will silently cut.
+    if text.len() > MAX_TYPED_COMMAND {
+        let _ = std::fs::remove_file(&path);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "staged command path is too long to source in one line",
+        ));
+    }
     Ok(StagedCommand {
         text,
         payload: Some(path),
@@ -121,8 +128,7 @@ fn stage_in(dir: &Path, command: &str, shell_name: &str, label: &str) -> io::Res
 }
 
 #[cfg(unix)]
-fn shell_path(path: &Path, shell_name: &str) -> io::Result<String> {
-    let _ = shell_name;
+fn shell_path(path: &Path) -> io::Result<String> {
     path.to_str().map(str::to_string).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
@@ -192,8 +198,6 @@ mod tests {
         assert!(!dir.exists(), "no payload directory should be created");
     }
 
-    /// refs #2862: a command too long to type becomes a short line that sources
-    /// a file, and the file carries the real command.
     #[test]
     fn an_over_long_command_is_staged_to_a_file() {
         let dir = scratch("over-long");
@@ -264,6 +268,40 @@ mod tests {
         );
         small.discard();
         large.discard();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// refs #2862: a shell herdr cannot source in keeps the command it would
+    /// have typed before. Rewriting it into a line that shell cannot run would
+    /// break commands under the cap that work today.
+    #[test]
+    fn a_shell_with_unknown_source_syntax_is_never_rewritten() {
+        let dir = scratch("unknown-shell");
+        let command = format!("claude '{}'", "A".repeat(4000));
+        for shell in ["nu", "csh", "tcsh", "elvish", "xonsh"] {
+            let staged = stage_in(&dir, &command, shell, "agent-claude").expect("stage");
+            assert_eq!(staged.text, command, "{shell} must be typed unchanged");
+            assert!(staged.payload.is_none(), "{shell} must stage no payload");
+        }
+        assert!(!dir.exists(), "no payload directory should be created");
+    }
+
+    /// A pane reports its shell as the process gives it: a login shell as
+    /// `-zsh`, another as a full path. Both must still be recognised, or
+    /// staging would quietly stop happening for the shells that need it most.
+    #[test]
+    fn a_shell_name_is_normalised_before_its_keyword_is_chosen() {
+        let dir = scratch("normalised");
+        let command = format!("claude '{}'", "A".repeat(4000));
+        for shell in ["-zsh", "/bin/ksh"] {
+            let staged = stage_in(&dir, &command, shell, "agent-claude").expect("stage");
+            assert!(
+                staged.text.starts_with(". "),
+                "{shell} must dot-source: {}",
+                staged.text
+            );
+            staged.discard();
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -27,7 +27,7 @@ use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize}
 use serde_json::{json, Value};
 use support::{
     cleanup_test_base, register_runtime_dir, register_spawned_herdr_pid,
-    unregister_spawned_herdr_pid,
+    unregister_spawned_herdr_pid, wait_for_socket,
 };
 
 /// Longer than the canonical line buffer on either platform, so one payload
@@ -78,17 +78,6 @@ fn test_lock() -> MutexGuard<'static, ()> {
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn wait_for_socket(path: &Path, timeout: Duration) {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if path.exists() && UnixStream::connect(path).is_ok() {
-            return;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    panic!("socket did not appear at {}", path.display());
 }
 
 /// A stand-in for the agent binary that records how many bytes of its argument
@@ -321,5 +310,68 @@ fn agent_start_delivers_long_args_at_a_raw_mode_prompt() {
         Some(&OVERSIZED_ARG.to_string()[..]),
         "a raw-mode prompt must still receive long commands; pane showed:\n{}",
         pane_read(&fixture.api_socket, &fixture.pane_id)
+    );
+}
+
+/// Every payload herdr has staged anywhere under a fixture's state directory.
+fn staged_payloads(base: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![base.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            if path
+                .file_name()
+                .is_some_and(|name| name == "staged-commands")
+            {
+                found.extend(
+                    fs::read_dir(&path)
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .map(|payload| payload.path()),
+                );
+            } else {
+                stack.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// refs #2862: staging writes the composed command, system prompt and all, to
+/// disk. A request rejected after that point must take the file with it rather
+/// than leave it readable in the state directory.
+#[test]
+fn a_rejected_agent_start_leaves_no_staged_payload() {
+    let _guard = test_lock();
+    let fixture = start_pane("rejected", "/bin/sh");
+    let response = send_json_request(
+        &fixture.api_socket,
+        "agent_start",
+        "agent.start",
+        json!({
+            "name": "probe",
+            "kind": "claude",
+            "pane_id": fixture.pane_id,
+            "args": ["A".repeat(OVERSIZED_ARG)],
+            "timeout_ms": 1,
+        }),
+    );
+    assert_eq!(
+        response["error"]["code"].as_str(),
+        Some("invalid_agent_timeout"),
+        "an out-of-range timeout must be rejected: {response}"
+    );
+    assert!(
+        staged_payloads(&fixture.base).is_empty(),
+        "a rejected request must not leave a staged payload: {:?}",
+        staged_payloads(&fixture.base)
     );
 }
