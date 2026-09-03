@@ -97,6 +97,10 @@ macOS 为 1024，Linux 为 4096。超出部分会被内核静默丢弃，因此�
 令来运行它，这就是你在窗格中看到的内容。该文件在运行的那一刻即被删除。更短的命令
 会原样输入，所以只有 `--append-system-prompt` 这类长参数才会出现这种显示。
 
+只有 Herdr 知道如何加载的 shell 才会这样暂存：`sh`、`bash`、`dash`、`zsh`、`ksh`
+和 `mksh` 使用 `.`，`fish` 使用 `source`。在 `csh`、`tcsh`、`nu`、`elvish`、`xonsh`
+以及 Windows 上，命令会原样输入，并且仍受行长限制。
+
 通过 `herdr pane send-text`、`herdr pane run` 或粘贴发送到窗格的文本仍按字面逐字送
 达，因此依旧受终端行长限制。shell 处于规范模式的时间比看上去更多：`bash` 和 `zsh`
 在其运行的每条命令期间都会回到规范模式，而 Ubuntu 上作为 `/bin/sh` 的 `dash` 从不

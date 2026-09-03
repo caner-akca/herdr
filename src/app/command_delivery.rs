@@ -76,7 +76,6 @@ fn payload_dir() -> PathBuf {
 
 #[cfg(unix)]
 fn stage_in(dir: &Path, command: &str, shell_name: &str, label: &str) -> io::Result<StagedCommand> {
-    use std::io::Write;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     let Some(keyword) = crate::platform::shell_source_keyword(shell_name) else {
@@ -98,11 +97,40 @@ fn stage_in(dir: &Path, command: &str, shell_name: &str, label: &str) -> io::Res
     let path_arg = shell_path(&path)?;
     let remove = shell_command(&["rm", "-f", "--", &path_arg], shell_name)?;
 
+    // Opened before the cleanup below can apply: `create_new` means a failure
+    // here found someone else's file, which is not ours to remove.
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .mode(0o600)
         .open(&path)?;
+
+    // Every failure past this point has to take the file with it. `discard`
+    // only runs on a `StagedCommand`, and these paths never return one.
+    match fill_payload(&mut file, &remove, command, keyword, &path_arg, shell_name) {
+        Ok(text) => Ok(StagedCommand {
+            text,
+            payload: Some(path),
+        }),
+        Err(err) => {
+            let _ = std::fs::remove_file(&path);
+            Err(err)
+        }
+    }
+}
+
+/// Write the payload into `file` and render the line that sources it.
+#[cfg(unix)]
+fn fill_payload(
+    file: &mut std::fs::File,
+    remove: &str,
+    command: &str,
+    keyword: &str,
+    path_arg: &str,
+    shell_name: &str,
+) -> io::Result<String> {
+    use std::io::Write;
+
     // The removal runs first: unlinking only drops the directory entry, and the
     // shell keeps reading through its open descriptor, so the command cleans
     // itself up immediately instead of outliving a long-running agent.
@@ -110,21 +138,17 @@ fn stage_in(dir: &Path, command: &str, shell_name: &str, label: &str) -> io::Res
     writeln!(file, "{command}")?;
     file.sync_all()?;
 
-    let text = shell_command(&[keyword, &path_arg], shell_name)?;
+    let text = shell_command(&[keyword, path_arg], shell_name)?;
     // The typed line is bounded by the path, not the payload, but a state
     // directory near PATH_MAX could still overrun the cap. Fail loudly rather
     // than type a line the line discipline will silently cut.
     if text.len() > MAX_TYPED_COMMAND {
-        let _ = std::fs::remove_file(&path);
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             "staged command path is too long to source in one line",
         ));
     }
-    Ok(StagedCommand {
-        text,
-        payload: Some(path),
-    })
+    Ok(text)
 }
 
 #[cfg(unix)]
@@ -303,6 +327,36 @@ mod tests {
             staged.discard();
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A path long enough to push the source line over the cap must fail
+    /// loudly and leave nothing behind: refusing is the point, and a payload
+    /// that outlives its refusal is the leak this module keeps closing.
+    #[test]
+    fn a_path_too_long_to_source_refuses_and_stages_nothing() {
+        // Two components under the 255-byte filename limit, long enough that
+        // `. '<path>'` cannot fit in MAX_TYPED_COMMAND.
+        let dir = scratch("long-path")
+            .join("d".repeat(230))
+            .join("e".repeat(230));
+        let command = format!("claude '{}'", "A".repeat(4000));
+
+        let err = match stage_in(&dir, &command, "zsh", "agent-claude") {
+            Ok(_) => panic!("staging must refuse a path too long to source"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData, "{err}");
+
+        let leftover: Vec<_> = std::fs::read_dir(&dir)
+            .expect("directory exists")
+            .flatten()
+            .map(|entry| entry.path())
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "a refused staging must leave no payload: {leftover:?}"
+        );
+        let _ = std::fs::remove_dir_all(scratch("long-path"));
     }
 
     /// fish dropped `.` as a source alias, so it needs the spelled-out form.

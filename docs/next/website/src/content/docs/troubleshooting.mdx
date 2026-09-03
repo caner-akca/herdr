@@ -100,6 +100,11 @@ pane. The file is removed the moment it runs. Commands shorter than that are
 typed unchanged, so this only appears for long arguments such as
 `--append-system-prompt`.
 
+Only shells Herdr knows how to source in are staged this way: `sh`, `bash`,
+`dash`, `zsh`, `ksh` and `mksh` use `.`, and `fish` uses `source`. In `csh`,
+`tcsh`, `nu`, `elvish` and `xonsh`, and on Windows, the command is typed
+unchanged and remains subject to the limit.
+
 Text sent with `herdr pane send-text`, `herdr pane run`, or pasted into a pane
 is delivered literally and is still subject to the terminal's line limit. Shells
 are in canonical mode more often than they look: `bash` and `zsh` return to it
