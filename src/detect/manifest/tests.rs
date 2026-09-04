@@ -909,6 +909,31 @@ fn claude_wrapped_mcp_elicitation_dialog_is_blocked() {
 }
 
 #[test]
+fn claude_mcp_elicitation_header_spans_one_wrap_only() {
+    // The quoted server name gets the same bounded tolerance as the footer: one
+    // continuation row, never a blank row and never a second wrap.
+    let rejected = [
+        (
+            "blank row inside the quoted name",
+            "MCP server \u{201C}notes\n\nserver\u{201D} requests your input\n\n\u{276F} Accept\n  Decline\n\nEsc to cancel\n",
+        ),
+        (
+            "name wrapped across three rows",
+            "MCP server \u{201C}a\nb\nc\u{201D} requests your input\n\n\u{276F} Accept\n  Decline\n\nEsc to cancel\n",
+        ),
+    ];
+
+    for (label, screen) in rejected {
+        let result = osc_explain(Agent::Claude, screen, "", "");
+        assert_ne!(
+            result.matched_rule.as_ref().map(|rule| rule.id.as_str()),
+            Some("mcp_elicitation_prompt"),
+            "{label}"
+        );
+    }
+}
+
+#[test]
 fn claude_wrapped_permission_prompt_keeps_its_own_rule() {
     // A narrow permission prompt already reported blocked, but only through the
     // priority 300 legacy fallback. The owning rule must keep the match.

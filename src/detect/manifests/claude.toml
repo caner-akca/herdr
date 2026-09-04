@@ -125,7 +125,7 @@ visible_blocker = true
 # the trailing words may wrap in a narrow pane (#2868).
 regex = [
   '(?i)esc(?:[ \t]+|[ \t]*\n[ \t]*)to(?:[ \t]+|[ \t]*\n[ \t]*)cancel',
-  '(?im)^[ \t]*MCP(?:[ \t]+|[ \t]*\n[ \t]*)server(?:[ \t]+|[ \t]*\n[ \t]*)["\x{201C}](?:[^\n]|\n[ \t]*){1,120}?["\x{201D}](?:[ \t]+|[ \t]*\n[ \t]*)requests(?:[ \t]+|[ \t]*\n[ \t]*)your(?:[ \t]+|[ \t]*\n[ \t]*)input[ \t]*$',
+  '(?im)^[ \t]*MCP(?:[ \t]+|[ \t]*\n[ \t]*)server(?:[ \t]+|[ \t]*\n[ \t]*)["\x{201C}][^\n]*?(?:\n[ \t]*[^\n]*?)?["\x{201D}](?:[ \t]+|[ \t]*\n[ \t]*)requests(?:[ \t]+|[ \t]*\n[ \t]*)your(?:[ \t]+|[ \t]*\n[ \t]*)input[ \t]*$',
 ]
 all = [
   { any = [
